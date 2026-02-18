@@ -1,0 +1,28 @@
+{
+    "name": "Custom Cloud Source",
+    "version": "1.0.0",
+    "author": "You",
+    "description": "Connect any cloud storage, personal server, or media library as a music source. Supports URL patterns, HTTP headers, and custom auth — no coding required.",
+    "type": "js",
+    "entry": "index.js",
+    "permissions": [
+        "network:fetch",
+        "ui:inject",
+        "player:control",
+        "library:write",
+        "library:read",
+        "storage:local"
+    ],
+    "category": "library",
+    "tags": [
+        "cloud",
+        "custom",
+        "server",
+        "streaming",
+        "s3",
+        "webdav",
+        "http"
+    ],
+    "license": "MIT",
+    "repository": "https://github.com/you/custom-cloud-source"
+}
