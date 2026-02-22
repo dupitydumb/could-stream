@@ -304,6 +304,7 @@
           title:       track.title   || "Unknown Track",
           artist:      track.artist  || "Unknown Artist",
           album:       track.album   || "",
+          track_number: track.trackNum || 0,
           duration:    track.duration || 0,
           cover_url:   track.cover_url || "",
           source_type: src.slug,           // e.g. "custom-my-nas"
@@ -338,14 +339,15 @@
 
     // ── Browse / scan a source ─────────────────────────────────────────────
     // Returns array of { title, artist, album, duration, cover_url, external_id }
-    async scanSource(src) {
+    // onProgress(state) = { folders, tracks, currentFolder, elapsed, perFolder }
+    async scanSource(src, onProgress) {
       const typeDef = SOURCE_TYPES[src.type];
       if (!typeDef) throw new Error("Unknown source type");
 
       switch (src.type) {
         case "url_list":    return this.scanUrlList(src);
-        case "http_index":  return this.scanHttpIndex(src);
-        case "webdav":      return this.scanWebDav(src);
+        case "http_index":  return this.scanHttpIndex(src, onProgress);
+        case "webdav":      return this.scanWebDav(src, onProgress);
         case "jellyfin":    return this.scanJellyfin(src);
         case "navidrome":   return this.scanNavidrome(src);
         case "s3":          return this.scanS3(src);
@@ -379,65 +381,389 @@
       });
     },
 
-    // HTTP Index: parse HTML directory listing for audio links
-    async scanHttpIndex(src) {
-      const headers = SOURCE_TYPES.http_index.buildHeaders(src.config);
-      const res = await this.apiFetch(src.config.baseUrl, headers);
-      const html = await res.text();
-      const base = src.config.baseUrl.replace(/\/$/, "");
+    // ── Folder/filename metadata parser ───────────────────────────────────
+    // Handles patterns like:
+    //   "Artist - Album (Year) [Format] {Catalog}"  → artist + album + year
+    //   "Artist - Album [Year]"                      → artist + album + year
+    //   "Artist/Album/01 - Track.flac"               → track number + title
+    //   "Artist/Album (Year)/01. Title.flac"         → full hierarchy
+    //   "01 Title.mp3", "01 - Title.mp3"             → track num + title
+    //   "Disc1/01-Title.flac"                        → disc-aware track num
+    parseFolderMeta(fullUrl, baseUrl, fallbackAlbum = "") {
+      const safeDecode = (s) => { try { return decodeURIComponent(s); } catch (_) { return s; } };
+      // Get the relative path from base
+      let rel = safeDecode(fullUrl.replace(baseUrl.replace(/\/$/, ""), "")).replace(/^\//, "");
+      const parts = rel.split("/");
+      const fileNameRaw = parts[parts.length - 1];
+      const fileName = fileNameRaw.replace(/\.[^.]+$/, ""); // strip extension
+      const folderParts = parts.slice(0, -1); // directories only
 
-      // Parse <a href="..."> links from directory listing
-      const links = [];
-      const re = /href="([^"?#]+)"/gi;
-      let m;
-      while ((m = re.exec(html)) !== null) {
-        const href = m[1];
-        if (AUDIO_EXTENSIONS.test(href)) {
-          const full = href.startsWith("http") ? href : `${base}/${href.replace(/^\//, "")}`;
-          links.push(full);
+      // ── Parse folder path for artist / album / year ──────────────────────
+      // Pattern: "Artist Name - Album Title (Year) [FORMAT] {Catalog}"
+      // or just: "Artist - Album"
+      // or:      "Artist/Album (Year)"
+      // or:      "Album (Year) [FORMAT]"
+      const folderAlbumRe = /^(.+?)\s*[-–]\s*(.+?)(?:\s*[\(\[]\s*(\d{4})\s*[\)\]])?(?:\s*[\[\(][^\]\)]*[\]\)])*\s*$/;
+      const yearRe = /[\(\[]\s*(\d{4})\s*[\)\]]/;
+      const formatRe = /[\[\(](FLAC|MP3|AAC|OGG|OPUS|WAV|AIFF|ALAC|DSD|MQA|320|256|128|Hi-Res|Lossless)[^\]\)]*[\]\)]/i;
+
+      let artist = "Unknown Artist";
+      let album = "";
+      let year = "";
+
+      // Walk folder parts from outermost in, looking for artist/album info
+      for (let i = 0; i < folderParts.length; i++) {
+        const part = folderParts[i];
+        const m = part.match(folderAlbumRe);
+        if (m) {
+          // "Artist - Album (Year) [FLAC]" style
+          const candidate_artist = m[1].trim();
+          const candidate_album  = m[2].trim().replace(/\s*[\[\(][^\]\)]*[\]\)]\s*/g, "").trim();
+          const candidate_year   = m[3] || (part.match(yearRe) || [])[1] || "";
+          if (i === 0 && folderParts.length === 1) {
+            // Single folder — treat as "Artist - Album"
+            artist = candidate_artist;
+            album  = candidate_album;
+          } else if (i === 0) {
+            // First folder is likely artist name
+            artist = candidate_artist;
+            album  = candidate_album || folderParts[1] || "";
+          } else {
+            // Deeper folder is likely album
+            album = candidate_album;
+          }
+          if (candidate_year) year = candidate_year;
+        } else {
+          // No dash separator — folder is either artist (top) or album (deeper)
+          const cleanPart = part.replace(/\s*[\[\(][^\]\)]*[\]\)]\s*/g, "").trim();
+          const y = (part.match(yearRe) || [])[1];
+          if (y) year = y;
+          if (i === 0 && folderParts.length > 1) {
+            artist = cleanPart || artist;
+          } else if (i > 0 || folderParts.length === 1) {
+            album = cleanPart || album;
+          }
         }
       }
 
-      return links.map(url => {
-        const fileName = decodeURIComponent(url.split("/").pop().split("?")[0]);
-        const name = fileName.replace(/\.[^.]+$/, "");
-        return { title: name, artist: "Unknown Artist", album: src.name, duration: 0, cover_url: "", external_id: url };
-      });
+      // Fallback: if no album found, use deepest folder name (cleaned)
+      if (!album && folderParts.length > 0) {
+        const deepest = folderParts[folderParts.length - 1];
+        album = deepest.replace(/\s*[\[\(][^\]\)]*[\]\)]\s*/g, "").replace(/\s*[-–]\s*.+$/, "").trim();
+        if (!year) year = (deepest.match(yearRe) || [])[1] || "";
+      }
+
+      // ── Parse filename for track number + title ──────────────────────────
+      // Patterns: "01 - Title", "01. Title", "1-Title", "01 Title", "D1T01 Title"
+      // Also handle: "Artist - Title" when no folder structure
+      let trackNum = 0;
+      let title = fileName;
+
+      // Disc-aware: D1T01, 1-01, etc.
+      const discTrackRe = /^(?:d(?:isc|isk?)?\s*\d+\s*[_-]?\s*)?t?r?a?c?k?\s*(\d+)[_.\s-]+(.+)$/i;
+      // Simple: "01 - Title" or "01. Title" or "01 Title"
+      const trackRe = /^(\d{1,3})[_.\s-]+(.+)$/;
+
+      const dtm = fileName.match(discTrackRe);
+      const tm  = fileName.match(trackRe);
+
+      if (dtm && dtm[2]) {
+        trackNum = parseInt(dtm[1], 10);
+        title = dtm[2].trim();
+      } else if (tm && tm[2]) {
+        trackNum = parseInt(tm[1], 10);
+        title = tm[2].replace(/^[-_.\s]+/, "").trim();
+      }
+
+      // If title still contains "Artist - Title" with no folder artist, extract it
+      if (artist === "Unknown Artist" && !folderParts.length) {
+        const dashM = title.match(/^(.+?)\s+[-–]\s+(.+)$/);
+        if (dashM) { artist = dashM[1].trim(); title = dashM[2].trim(); }
+      }
+
+      // Append year to album if we have it and it's not already there
+      const albumWithYear = album && year && !album.includes(year)
+        ? `${album} (${year})`
+        : album;
+
+      return {
+        title:    title   || fileName || "Unknown Track",
+        artist:   artist  || "Unknown Artist",
+        album:    albumWithYear || fallbackAlbum || "",
+        trackNum
+      };
     },
 
-    // WebDAV: use PROPFIND to list files
-    async scanWebDav(src) {
-      const base = src.config.baseUrl.replace(/\/$/, "");
-      const authHeader = SOURCE_TYPES.webdav.buildHeaders(src.config);
-      const body = `<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:getcontentlength/><d:getcontenttype/></d:prop></d:propfind>`;
+    // HTTP Index: recursively crawl HTML directory listing for audio files
+    async scanHttpIndex(src, onProgress) {
+      const headers = SOURCE_TYPES.http_index.buildHeaders(src.config);
+      const baseUrl = src.config.baseUrl.replace(/\/$/, "") + "/";
 
-      const res = await this.apiFetch(base, {
-        ...authHeader,
-        "Depth": "1",
-        "Content-Type": "application/xml"
+      const results = [];
+      const visited = new Set();
+      const startTime = Date.now();
+      const folderTimes = []; // ms per folder, for ETA
+
+      const emitProgress = (currentFolder) => {
+        if (!onProgress) return;
+        const elapsed = Date.now() - startTime;
+        const avgPerFolder = folderTimes.length
+          ? folderTimes.reduce((a, b) => a + b, 0) / folderTimes.length
+          : 0;
+        // pending = folders queued but not yet visited (approximation)
+        const pending = Math.max(0, visited.size - folderTimes.length - 1);
+        const eta = avgPerFolder > 0 ? Math.round((pending * avgPerFolder) / 1000) : null;
+        onProgress({
+          folders: folderTimes.length,
+          tracks:  results.length,
+          currentFolder,
+          elapsed,
+          eta
+        });
+      };
+
+      const crawl = async (url) => {
+        if (visited.has(url)) return;
+        visited.add(url);
+
+        const folderStart = Date.now();
+
+        // Emit before fetch so UI shows current folder name
+        const safeDecode = (s) => { try { return decodeURIComponent(s); } catch (_) { return s; } };
+        const folderName = safeDecode(url.replace(baseUrl, "").replace(/\/$/, "").split("/").pop() || "/");
+        emitProgress(folderName);
+
+        let html;
+        try {
+          const res = await this.apiFetch(url, headers);
+          html = await res.text();
+        } catch (e) {
+          console.warn("[CustomCloud] Could not fetch:", url, e.message);
+          folderTimes.push(Date.now() - folderStart);
+          return;
+        }
+
+        const audioLinks   = [];
+        const folderLinks  = [];
+
+        // Extract all hrefs — handle both href="..." and href='...'
+        const re = /href=["']([^"'?#]*)["']/gi;
+        let m;
+        while ((m = re.exec(html)) !== null) {
+          const href = m[1].trim();
+          if (!href || href === "/" || href === "../" || href === "./" || href.startsWith("?") || href.startsWith("#")) continue;
+
+          // Build full URL safely
+          let full;
+          try {
+            if (href.startsWith("http://") || href.startsWith("https://")) {
+              full = href;
+            } else if (href.startsWith("/")) {
+              // Extract origin without new URL()
+              const protoEnd = url.indexOf("//") + 2;
+              const pathStart = url.indexOf("/", protoEnd);
+              const origin = pathStart > 0 ? url.slice(0, pathStart) : url;
+              full = origin + href;
+            } else {
+              full = url.replace(/\/$/, "") + "/" + href;
+            }
+          } catch (_) { continue; }
+
+          // Normalize double slashes (keep protocol)
+          full = full.replace(/([^:])\/\/+/g, "$1/");
+
+          // Skip if it goes above our base
+          if (!full.startsWith(baseUrl.replace(/\/$/, ""))) continue;
+
+          if (AUDIO_EXTENSIONS.test(href)) {
+            audioLinks.push(full);
+          } else if (href.endsWith("/") || (!href.includes(".") && href !== "")) {
+            // Likely a subdirectory
+            if (!visited.has(full)) folderLinks.push(full);
+          }
+        }
+
+        // Add audio files found at this level
+        for (const audioUrl of audioLinks) {
+          const meta = this.parseFolderMeta(audioUrl, baseUrl, src.name);
+          results.push({
+            title:       meta.title,
+            artist:      meta.artist,
+            album:       meta.album,
+            trackNum:    meta.trackNum,
+            duration:    0,
+            cover_url:   "",
+            external_id: audioUrl
+          });
+        }
+
+        folderTimes.push(Date.now() - folderStart);
+        emitProgress(folderName); // update track count after adding
+
+        // Recurse into subdirectories (up to reasonable depth)
+        const depth = (url.replace(baseUrl, "").match(/\//g) || []).length;
+        if (depth < 8) {
+          for (const folder of folderLinks) {
+            await crawl(folder.endsWith("/") ? folder : folder + "/");
+          }
+        }
+      };
+
+      await crawl(baseUrl);
+
+      // Sort by album, then track number, then title
+      results.sort((a, b) => {
+        const aAlb = (a.album || "").toLowerCase();
+        const bAlb = (b.album || "").toLowerCase();
+        if (aAlb !== bAlb) return aAlb.localeCompare(bAlb);
+        if (a.trackNum !== b.trackNum) return (a.trackNum || 999) - (b.trackNum || 999);
+        return (a.title || "").localeCompare(b.title || "");
       });
 
-      // Try plain GET fallback (some servers expose a directory page)
-      const text = await res.text();
-      const links = [];
-      const re = /<d:href>([^<]+)<\/d:href>/gi;
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        const href = m[1].trim();
-        if (AUDIO_EXTENSIONS.test(href)) {
-          // Store relative path as externalId
-          const rel = href.replace(new URL(base).pathname, "").replace(/^\//, "");
-          const fileName = decodeURIComponent(href.split("/").pop());
-          const name = fileName.replace(/\.[^.]+$/, "");
-          links.push({ title: name, artist: "Unknown Artist", album: src.name, duration: 0, cover_url: "", external_id: rel });
+      return results;
+    },
+
+    // WebDAV: PROPFIND with Depth:infinity (falls back to recursive Depth:1)
+    async scanWebDav(src) {
+      const base = src.config.baseUrl.replace(/\/$/, "");
+      const baseUrl = base + "/";
+      const authHeaders = SOURCE_TYPES.webdav.buildHeaders(src.config);
+      const propfindBody = `<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:getcontenttype/><d:resourcetype/></d:prop></d:propfind>`;
+
+      const parseResponses = (xml, currentBase) => {
+        const items = { audio: [], folders: [] };
+        // Match <d:response> blocks
+        const responseRe = /<(?:d:)?response[^>]*>([\s\S]*?)<\/(?:d:)?response>/gi;
+        let rm;
+        while ((rm = responseRe.exec(xml)) !== null) {
+          const block = rm[1];
+          const hrefM = block.match(/<(?:d:)?href[^>]*>([^<]+)<\/(?:d:)?href>/i);
+          if (!hrefM) continue;
+          const href = decodeURIComponent(hrefM[1].trim());
+
+          // Determine if collection (folder) or file
+          const isCollection = /<(?:d:)?collection\s*\/>/i.test(block);
+          if (isCollection) {
+            // Only recurse into subfolders (not the root itself)
+            if (href !== new URL(base).pathname && href !== new URL(base).pathname + "/") {
+              items.folders.push(href);
+            }
+          } else if (AUDIO_EXTENSIONS.test(href)) {
+            items.audio.push(href);
+          }
         }
+        return items;
+      };
+
+      const hrefToFullUrl = (href) => {
+        if (href.startsWith("http://") || href.startsWith("https://")) return href;
+        const u = new URL(base);
+        return `${u.origin}${href}`;
+      };
+
+      const results = [];
+      const visited = new Set();
+
+      const crawl = async (url, depth = "1") => {
+        if (visited.has(url)) return;
+        visited.add(url);
+
+        let xml;
+        try {
+          const fetchFn = this.api?.fetch
+            ? (u, opts) => this.api.fetch(u, opts)
+            : (u, opts) => fetch(u, opts);
+          const res = await fetchFn(url, {
+            method: "PROPFIND",
+            headers: { ...authHeaders, "Depth": depth, "Content-Type": "application/xml" },
+            body: propfindBody
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          xml = await res.text();
+        } catch (e) {
+          console.warn("[CustomCloud] WebDAV PROPFIND failed:", url, e.message);
+          // Fallback to HTTP index parsing for this path
+          try {
+            const fakeSrc = { ...src, config: { ...src.config, baseUrl: url } };
+            const fallback = await this.scanHttpIndex(fakeSrc);
+            results.push(...fallback);
+          } catch {}
+          return;
+        }
+
+        const { audio, folders } = parseResponses(xml, url);
+
+        for (const href of audio) {
+          const fullUrl = hrefToFullUrl(href);
+          const meta = this.parseFolderMeta(fullUrl, baseUrl, src.name);
+          // For WebDAV, externalId = relative path from baseUrl
+          const rel = href.replace(new URL(base).pathname, "").replace(/^\//, "");
+          results.push({
+            title:    meta.title,
+            artist:   meta.artist,
+            album:    meta.album,
+            trackNum: meta.trackNum,
+            duration: 0, cover_url: "", external_id: rel
+          });
+        }
+
+        // Recurse into subdirs
+        for (const folderHref of folders) {
+          const folderUrl = hrefToFullUrl(folderHref);
+          const normalized = folderUrl.endsWith("/") ? folderUrl : folderUrl + "/";
+          if (!visited.has(normalized)) await crawl(normalized, "1");
+        }
+      };
+
+      // Try Depth:infinity first (faster, one request) — many servers support it
+      let triedInfinity = false;
+      try {
+        const fetchFn = this.api?.fetch
+          ? (u, opts) => this.api.fetch(u, opts)
+          : (u, opts) => fetch(u, opts);
+        const res = await fetchFn(baseUrl, {
+          method: "PROPFIND",
+          headers: { ...authHeaders, "Depth": "infinity", "Content-Type": "application/xml" },
+          body: propfindBody
+        });
+        if (res.ok) {
+          triedInfinity = true;
+          const xml = await res.text();
+          const { audio } = parseResponses(xml, baseUrl);
+          if (audio.length > 0) {
+            for (const href of audio) {
+              const fullUrl = hrefToFullUrl(href);
+              const meta = this.parseFolderMeta(fullUrl, baseUrl, src.name);
+              const rel = href.replace(new URL(base).pathname, "").replace(/^\//, "");
+              results.push({
+                title: meta.title, artist: meta.artist, album: meta.album,
+                trackNum: meta.trackNum, duration: 0, cover_url: "", external_id: rel
+              });
+            }
+          }
+        }
+      } catch (_) {}
+
+      // If infinity didn't work or returned nothing, fall back to recursive Depth:1
+      if (!triedInfinity || results.length === 0) {
+        await crawl(baseUrl, "1");
       }
 
-      if (links.length === 0) {
-        // Fallback: treat like HTTP index
+      if (results.length === 0) {
+        // Last resort: parse like an HTTP index page
         return this.scanHttpIndex(src);
       }
-      return links;
+
+      // Sort by album → track number → title
+      results.sort((a, b) => {
+        const aAlb = (a.album || "").toLowerCase();
+        const bAlb = (b.album || "").toLowerCase();
+        if (aAlb !== bAlb) return aAlb.localeCompare(bAlb);
+        if (a.trackNum !== b.trackNum) return (a.trackNum || 999) - (b.trackNum || 999);
+        return (a.title || "").localeCompare(b.title || "");
+      });
+
+      return results;
     },
 
     // Jellyfin: use Items API
@@ -879,6 +1205,33 @@
         }
         @keyframes cc-spin { to { transform: rotate(360deg); } }
 
+        /* ── Progress bar ────────────────────────────────────────────── */
+        .cc-progress-area {
+          display: flex; flex-direction: column; gap: 8px;
+          width: 100%; max-width: 340px;
+        }
+        .cc-progress-bar-track {
+          width: 100%; height: 4px;
+          background: var(--border-color, #2a2a2a);
+          border-radius: 2px; overflow: hidden;
+        }
+        .cc-progress-bar-fill {
+          height: 100%; width: 0%;
+          background: var(--accent-primary, #1a62b9);
+          border-radius: 2px;
+          transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .cc-progress-stats {
+          font-size: 12px; color: var(--text-secondary, #888);
+          text-align: center; font-variant-numeric: tabular-nums;
+        }
+        .cc-progress-folder {
+          font-size: 11px; color: var(--text-subdued, #555);
+          text-align: center;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+          max-width: 340px;
+        }
+
         /* ── Player bar button ───────────────────────────────────────── */
         .cc-playerbar-btn {
           display: inline-flex; align-items: center; gap: 7px;
@@ -1236,16 +1589,66 @@
       this.setHeader(`Browse: ${src.name}`, true);
 
       const body = document.getElementById("cc-body");
+      const isRecursive = src.type === "http_index" || src.type === "webdav";
+
       body.innerHTML = `
         <div class="cc-scanning-wrap">
           <div class="cc-spinner"></div>
-          <div>Scanning ${this.esc(src.name)}…</div>
-          <div style="font-size:12px; color:var(--text-subdued,#555)">Fetching track list from your server</div>
+          <div id="cc-scan-label" style="font-size:15px; font-weight:600;">Scanning ${this.esc(src.name)}…</div>
+          <div id="cc-scan-sub" style="font-size:12px; color:var(--text-subdued,#555); margin-top:2px;">
+            ${isRecursive ? "Crawling folders…" : "Fetching track list from your server"}
+          </div>
+          ${isRecursive ? `
+          <div class="cc-progress-area" style="width:100%; max-width:340px; margin-top:16px;">
+            <div class="cc-progress-bar-track">
+              <div class="cc-progress-bar-fill" id="cc-prog-fill"></div>
+            </div>
+            <div class="cc-progress-stats" id="cc-prog-stats">Starting…</div>
+            <div class="cc-progress-folder" id="cc-prog-folder"></div>
+          </div>` : ""}
         </div>
       `;
 
+      // Live progress updater for recursive scans
+      let lastFolderCount = 0;
+      const onProgress = isRecursive ? (state) => {
+        const statsEl  = document.getElementById("cc-prog-stats");
+        const folderEl = document.getElementById("cc-prog-folder");
+        const fillEl   = document.getElementById("cc-prog-fill");
+        if (!statsEl) return;
+
+        // Animate the indeterminate bar based on folder count (no end known yet)
+        // Each folder wiggles bar forward; cap at 90% until done
+        if (fillEl) {
+          const pct = Math.min(90, state.folders * 4);
+          fillEl.style.width = pct + "%";
+        }
+
+        const elapsed = Math.round(state.elapsed / 1000);
+        let etaStr = "";
+        if (state.eta !== null && state.eta > 1) {
+          etaStr = ` · ~${state.eta}s left`;
+        }
+
+        statsEl.textContent = `${state.folders} folder${state.folders !== 1 ? "s" : ""} · ${state.tracks} track${state.tracks !== 1 ? "s" : ""} found · ${elapsed}s elapsed${etaStr}`;
+
+        if (folderEl && state.currentFolder && state.currentFolder !== "/") {
+          folderEl.textContent = `📂 ${state.currentFolder}`;
+        }
+
+        lastFolderCount = state.folders;
+      } : null;
+
       try {
-        const tracks = await this.scanSource(src);
+        const tracks = await this.scanSource(src, onProgress);
+
+        // Snap bar to 100%
+        const fillEl = document.getElementById("cc-prog-fill");
+        if (fillEl) { fillEl.style.width = "100%"; fillEl.style.transition = "width 0.3s ease"; }
+
+        // Brief pause so user sees 100% before switching view
+        if (isRecursive) await new Promise(r => setTimeout(r, 350));
+
         this.browseItems = tracks;
         this.renderBrowse(src, tracks);
       } catch (err) {
@@ -1338,10 +1741,12 @@
       const dur = track.duration ? this.fmtDur(track.duration) : "";
       const sub = [track.artist, track.album].filter(Boolean).join(" · ");
       const idx = num - 1;
+      // Prefer the parsed track number from file metadata over the list row index
+      const displayNum = track.trackNum || num;
       return `
         <div class="cc-track-row" data-idx="${idx}">
           <div style="position:relative; width:32px; display:flex; align-items:center; justify-content:center;">
-            <span class="cc-track-num">${num}</span>
+            <span class="cc-track-num">${displayNum}</span>
             <span class="cc-play-icon">${I.play}</span>
           </div>
           <div style="overflow:hidden">
