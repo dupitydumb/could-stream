@@ -1,7 +1,7 @@
 {
     "name": "Custom Cloud Source",
-    "version": "1.0.0",
-    "author": "You",
+    "version": "1.0.1",
+    "author": "M",
     "description": "Connect any cloud storage, personal server, or media library as a music source. Supports URL patterns, HTTP headers, and custom auth — no coding required.",
     "type": "js",
     "entry": "index.js",
@@ -24,5 +24,5 @@
         "http"
     ],
     "license": "MIT",
-    "repository": "https://github.com/you/custom-cloud-source"
+    "repository": "https://github.com/dupitydumb/could-stream"
 }
